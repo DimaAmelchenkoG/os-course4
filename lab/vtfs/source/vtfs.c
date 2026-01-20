@@ -1,3 +1,4 @@
+
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/printk.h>
@@ -26,22 +27,28 @@ static int vtfs_mkdir(
     umode_t mode
 );
 
+static void vtfs_evict_inode(struct inode *inode);
+
+struct vtfs_inode_info {
+    char *data;
+    size_t size;
+    size_t capacity;
+};
+
+
 static int vtfs_rmdir(
     struct inode *parent_inode,
     struct dentry *child_dentry
 );
+
 struct vtfs_node {
     char name[NAME_MAX];
     struct inode *inode;
-
     bool is_dir;
-
-    char *data;
-    size_t size;
-    size_t capacity;
-
     struct list_head list;
 };
+
+
 
 static int vtfs_mkdir(
     struct mnt_idmap *idmap,
@@ -50,6 +57,14 @@ static int vtfs_mkdir(
     umode_t mode
 );
 
+static int vtfs_link(
+    struct dentry *old_dentry,
+    struct inode *parent_inode,
+    struct dentry *new_dentry
+);
+
+
+static int vtfs_drop_inode(struct inode *inode);
 
 static LIST_HEAD(vtfs_files);
 
@@ -60,34 +75,29 @@ static ssize_t vtfs_read(
     loff_t *ppos
 ) {
     struct inode *inode = file_inode(file);
-    struct vtfs_node *node;
+    struct vtfs_inode_info *info = inode->i_private;
     size_t to_read;
+
+    if (!info)
+        return -EIO;
 
     mutex_lock(&vtfs_lock);
 
-    list_for_each_entry(node, &vtfs_files, list) {
-        if (node->inode == inode) {
-
-            if (*ppos >= node->size) {
-                mutex_unlock(&vtfs_lock);
-                return 0;
-            }
-
-            to_read = min(len, node->size - *ppos);
-
-            if (copy_to_user(buf, node->data + *ppos, to_read)) {
-                mutex_unlock(&vtfs_lock);
-                return -EFAULT;
-            }
-
-            *ppos += to_read;
-            mutex_unlock(&vtfs_lock);
-            return to_read;
-        }
+    if (*ppos >= info->size) {
+        mutex_unlock(&vtfs_lock);
+        return 0;
     }
 
+    to_read = min(len, info->size - *ppos);
+
+    if (copy_to_user(buf, info->data + *ppos, to_read)) {
+        mutex_unlock(&vtfs_lock);
+        return -EFAULT;
+    }
+
+    *ppos += to_read;
     mutex_unlock(&vtfs_lock);
-    return -ENOENT;
+    return to_read;
 }
 
 static ssize_t vtfs_write(
@@ -97,39 +107,33 @@ static ssize_t vtfs_write(
     loff_t *ppos
 ) {
     struct inode *inode = file_inode(file);
-    struct vtfs_node *node;
+    struct vtfs_inode_info *info = inode->i_private;
     size_t to_write;
+
+    if (!info)
+        return -EIO;
 
     mutex_lock(&vtfs_lock);
 
-    list_for_each_entry(node, &vtfs_files, list) {
-        if (node->inode == inode) {
-
-            if (*ppos >= node->capacity) {
-                mutex_unlock(&vtfs_lock);
-                return -ENOSPC;
-            }
-
-            to_write = min(len, node->capacity - *ppos);
-
-            if (copy_from_user(node->data + *ppos, buf, to_write)) {
-                mutex_unlock(&vtfs_lock);
-                return -EFAULT;
-            }
-
-            *ppos += to_write;
-            node->size = max(node->size, (size_t)*ppos);
-            inode->i_size = node->size;
-
-            mutex_unlock(&vtfs_lock);
-            return to_write;
-        }
+    if (*ppos >= info->capacity) {
+        mutex_unlock(&vtfs_lock);
+        return -ENOSPC;
     }
 
-    mutex_unlock(&vtfs_lock);
-    return -ENOENT;
-}
+    to_write = min(len, info->capacity - *ppos);
 
+    if (copy_from_user(info->data + *ppos, buf, to_write)) {
+        mutex_unlock(&vtfs_lock);
+        return -EFAULT;
+    }
+
+    *ppos += to_write;
+    info->size = max(info->size, (size_t)*ppos);
+    inode->i_size = info->size;
+
+    mutex_unlock(&vtfs_lock);
+    return to_write;
+}
 
 static const struct file_operations vtfs_file_fops = {
     .read  = vtfs_read,
@@ -228,10 +232,12 @@ static void vtfs_kill_sb(struct super_block *sb) {
 }
 
 static struct file_system_type vtfs_fs_type = {
-    .name = "vtfs",
-    .mount = vtfs_mount,
+    .owner   = THIS_MODULE,
+    .name    = "vtfs",
+    .mount   = vtfs_mount,
     .kill_sb = vtfs_kill_sb,
 };
+
 
 static int vtfs_create(
     struct mnt_idmap *idmap,
@@ -251,12 +257,15 @@ static struct inode_operations vtfs_inode_ops = {
     .create = vtfs_create,
     .unlink = vtfs_unlink,
     .mkdir  = vtfs_mkdir,  
-    .rmdir  = vtfs_rmdir,   
+    .rmdir  = vtfs_rmdir,
+     .link   = vtfs_link,   
 };
+
 
 static const struct super_operations vtfs_super_ops = {
     .statfs      = simple_statfs,
-    .drop_inode  = generic_delete_inode,
+    .drop_inode  = vtfs_drop_inode,
+    .evict_inode = vtfs_evict_inode,
 };
 
 
@@ -276,24 +285,9 @@ static int vtfs_create(
     umode_t mode,
     bool excl
 ) {
-    struct vtfs_node *node;
     struct inode *inode;
-
-    if (parent_inode->i_ino != 100)
-        return -EPERM;
-
-    node = kzalloc(sizeof(*node), GFP_KERNEL);
-    if (!node)
-        return -ENOMEM;
-
-    node->capacity = VTFS_MAX_FILE_SIZE;
-    node->size = 0;
-
-    node->data = kzalloc(node->capacity, GFP_KERNEL);
-    if (!node->data) {
-        kfree(node);
-        return -ENOMEM;
-    }
+    struct vtfs_node *node;
+    struct vtfs_inode_info *info;
 
     inode = vtfs_get_inode(
         parent_inode->i_sb,
@@ -301,42 +295,94 @@ static int vtfs_create(
         S_IFREG | mode,
         get_next_ino()
     );
+    if (!inode)
+        return -ENOMEM;
 
-    if (!inode) {
-        kfree(node->data);
-        kfree(node);
+    info = kzalloc(sizeof(*info), GFP_KERNEL);
+    if (!info) {
+        iput(inode);
         return -ENOMEM;
     }
 
-    strscpy(node->name, child_dentry->d_name.name, NAME_MAX);
+    info->capacity = VTFS_MAX_FILE_SIZE;
+    info->size = 0;
+    info->data = kzalloc(info->capacity, GFP_KERNEL);
+    if (!info->data) {
+        kfree(info);
+        iput(inode);
+        return -ENOMEM;
+    }
+
+    inode->i_private = info;
+
+    node = kzalloc(sizeof(*node), GFP_KERNEL);
+    if (!node) {
+        kfree(info->data);
+        kfree(info);
+        iput(inode);
+        return -ENOMEM;
+    }
+
     node->inode = inode;
+    node->is_dir = false;
+    strscpy(node->name, child_dentry->d_name.name, NAME_MAX);
 
     mutex_lock(&vtfs_lock);
     list_add(&node->list, &vtfs_files);
     mutex_unlock(&vtfs_lock);
 
     d_add(child_dentry, inode);
-
     return 0;
 }
 
 
+static int vtfs_link(
+    struct dentry *old_dentry,
+    struct inode *parent_inode,
+    struct dentry *new_dentry
+) {
+    struct inode *inode = d_inode(old_dentry);
+    struct vtfs_node *node;
+
+    if (S_ISDIR(inode->i_mode))
+        return -EPERM;
+
+    node = kzalloc(sizeof(*node), GFP_KERNEL);
+    if (!node)
+        return -ENOMEM;
+
+    node->inode = inode;
+    node->is_dir = false;
+    strscpy(node->name, new_dentry->d_name.name, NAME_MAX);
+
+    inode_inc_link_count(inode);
+
+    mutex_lock(&vtfs_lock);
+    list_add(&node->list, &vtfs_files);
+    mutex_unlock(&vtfs_lock);
+
+    d_add(new_dentry, inode);
+    return 0;
+}
 
 static int vtfs_unlink(
     struct inode *parent_inode,
     struct dentry *child_dentry
 ) {
     struct vtfs_node *node, *tmp;
+    struct inode *inode = d_inode(child_dentry);
 
     mutex_lock(&vtfs_lock);
 
     list_for_each_entry_safe(node, tmp, &vtfs_files, list) {
         if (strcmp(node->name, child_dentry->d_name.name) == 0) {
             list_del(&node->list);
-            mutex_unlock(&vtfs_lock);
-
-            kfree(node->data);
             kfree(node);
+
+            inode_dec_link_count(inode);
+
+
+            mutex_unlock(&vtfs_lock);
             return 0;
         }
     }
@@ -344,6 +390,20 @@ static int vtfs_unlink(
     mutex_unlock(&vtfs_lock);
     return -ENOENT;
 }
+
+static int vtfs_drop_inode(struct inode *inode)
+{
+    /*
+     * НЕ удаляем inode, пока он есть в нашем списке vtfs_files
+     */
+    if (inode->i_nlink > 0)
+        return 0;
+
+    return generic_drop_inode(inode);
+}
+
+
+
 
 
 
@@ -372,6 +432,19 @@ if (S_ISDIR(mode)) {
 
 
     return inode;
+}
+
+static void vtfs_evict_inode(struct inode *inode)
+{
+    struct vtfs_inode_info *info = inode->i_private;
+
+    truncate_inode_pages_final(&inode->i_data);
+    clear_inode(inode);
+
+    if (info) {
+        kfree(info->data);
+        kfree(info);
+    }
 }
 
 
